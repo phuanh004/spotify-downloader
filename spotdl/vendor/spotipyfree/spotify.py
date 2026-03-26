@@ -1,4 +1,91 @@
+import json
+import base64
+import logging
+
+import httpx
 import spotapi
+from spotapi.client import BaseClient
+from spotapi.http.request import TLSClient
+from spotapi.utils.strings import extract_js_links, extract_mappings, combine_chunks
+
+logger = logging.getLogger(__name__)
+
+_DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+_DESKTOP_HEADERS = {
+    "User-Agent": _DESKTOP_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+# Patch TLSClient.build_request to enforce a timeout on every request.
+_original_build_request = TLSClient.build_request
+
+
+def _patched_build_request(self, method, url, **kwargs):
+    kwargs.setdefault("timeout_seconds", 15)
+    return _original_build_request(self, method, url, **kwargs)
+
+
+TLSClient.build_request = _patched_build_request
+
+
+# Replace get_session + get_sha256_hash with httpx-based versions.
+# tls_client fails to download large CDN JS bundles and also gets served
+# the mobile web player (missing desktop web-player hashes).
+# httpx with desktop headers solves both issues.
+
+def _patched_get_session(self):
+    """Fetch Spotify session using httpx with desktop User-Agent."""
+    with httpx.Client(headers=_DESKTOP_HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = client.get("https://open.spotify.com")
+        resp.raise_for_status()
+        html = resp.text
+
+    all_js = extract_js_links(html)
+    self.js_pack = next(
+        (link for link in all_js if "web-player/web-player" in link and link.endswith(".js")),
+        "",
+    )
+
+    raw_cfg = html.split('<script id="appServerConfig" type="text/plain">')[1].split("</script>")[0]
+    self.server_cfg = json.loads(base64.b64decode(raw_cfg).decode("utf-8"))
+    self.client_version = self.server_cfg.get("clientVersion", "")
+    self.device_id = self.server_cfg.get("correlationId", "")
+
+    self._get_auth_vars()
+
+
+def _patched_get_sha256_hash(self):
+    """Fetch SHA256 hashes from Spotify JS bundles using httpx."""
+    if self.js_pack is type(None) or not self.js_pack:
+        self.get_session()
+
+    if not self.js_pack:
+        raise ValueError("Could not find web-player JS bundle")
+
+    with httpx.Client(headers=_DESKTOP_HEADERS, timeout=30, follow_redirects=True) as client:
+        resp = client.get(str(self.js_pack))
+        resp.raise_for_status()
+        self.raw_hashes = resp.text
+
+        str_mapping, hash_mapping = extract_mappings(str(self.raw_hashes))
+        urls = [
+            f"https://open.spotifycdn.com/cdn/build/web-player/{s}"
+            for s in combine_chunks(hash_mapping, str_mapping)
+        ]
+
+        for url in urls:
+            chunk_resp = client.get(url)
+            chunk_resp.raise_for_status()
+            self.raw_hashes += chunk_resp.text
+
+
+BaseClient.get_session = _patched_get_session
+BaseClient.get_sha256_hash = _patched_get_sha256_hash
 
 
 class Spotify:
@@ -6,8 +93,9 @@ class Spotify:
     Wrapper that makes SpotAPI behave like Spotipy.
     Only implements commonly used methods but can be expanded.
 
-    Vendored from spotipyfree 1.0.7 with search fix for spotapi >= 1.2.x
-    (spotapi.Search was removed; replaced with spotapi.Public().song_search).
+    Vendored from spotipyfree 1.0.7 with fixes:
+    - search: uses spotapi.Public().song_search() (spotapi.Search removed in >= 1.2.x)
+    - increased TLS auto_retries for transient network failures
     """
 
     def __init__(self, username=None, password=None):
@@ -229,9 +317,8 @@ class Spotify:
         return meta
 
     def search(self, query, limit=50, offset=0, type="track", *args, **kwargs):
-        p = spotapi.Public()
         all_items = []
-        for page in p.song_search(query):
+        for page in spotapi.Public().song_search(query):
             if isinstance(page, list):
                 all_items.extend(page)
             elif isinstance(page, dict):
