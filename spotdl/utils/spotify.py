@@ -214,7 +214,7 @@ if USEOFFICIALAPI:
 
 else:
     # override the SpotifyClient with the non-official one
-    from SpotipyFree import Spotify as SpotifyClient           # type: ignore
+    from spotdl.vendor.spotipyfree import Spotify as SpotifyClient  # type: ignore
 
     def save_spotify_cache(cache: Dict[str, Optional[Dict]]):
         """
