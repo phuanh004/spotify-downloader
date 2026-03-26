@@ -37,7 +37,11 @@ class DownloadManager:
             loop = asyncio.ProactorEventLoop()
             asyncio.set_event_loop(loop)
 
-        self.loop = asyncio.get_event_loop()
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
         # ! semaphore is required to limit concurrent asyncio executions
         self.semaphore = asyncio.Semaphore(arguments["download_threads"])
 

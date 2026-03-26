@@ -1,6 +1,6 @@
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
-import pkg_resources
+from importlib.metadata import version as _get_version
 
 help_notice = r"""
 To download a song run,
@@ -95,7 +95,7 @@ def parse_arguments():
     )
 
     # Version
-    version = pkg_resources.require("spotdl")[0].version
+    version = _get_version("spotdl")
     parser.add_argument("--version", "-v", action="version", version=version)
 
     # Option to enable debug termination
