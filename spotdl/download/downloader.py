@@ -25,6 +25,7 @@ from spotdl.providers.audio import (
     SoundCloud,
     YouTube,
     YouTubeMusic,
+    AudioProviderError
 )
 from spotdl.providers.lyrics import AzLyrics, Genius, LyricsProvider, MusixMatch, Synced
 from spotdl.types.options import DownloaderOptionalOptions, DownloaderOptions
@@ -44,6 +45,8 @@ from spotdl.utils.lrc import generate_lrc
 from spotdl.utils.m3u import gen_m3u_files
 from spotdl.utils.metadata import MetadataError, embed_metadata
 from spotdl.utils.search import gather_known_songs, reinit_song, songs_from_albums
+from spotdl.utils.matching import order_results
+from spotdl.utils.formatter import create_song_title, create_search_query
 
 __all__ = [
     "AUDIO_PROVIDERS",
@@ -394,6 +397,36 @@ class Downloader:
 
         raise LookupError(f"No results found for song: {song.display_name}")
 
+    def search_all(self, song: Song) -> List[str]:
+        """
+        Search for a song and return all candidate URLs ordered by match score.
+
+        ### Arguments
+        - song: The song to search for.
+
+        ### Returns
+        - list of candidate URLs, best match first.
+        """
+        
+        search_query = create_song_title(song.name, song.artists).lower()
+        for audio_provider in self.audio_providers:
+            primary = audio_provider.search(song)
+            search_results = audio_provider.get_results(search_query)
+            if self.settings["only_verified_results"]:
+                search_results = [
+                    result.url for result in search_results if result.verified
+                ]
+            else:
+                search_results = [
+                    result.url for result in search_results
+                ]
+            
+            if primary in search_results:
+                search_results.remove(primary)
+            if type(primary) == str:               #< sometimes returns Nonetype
+                search_results = [primary]+search_results
+            return search_results
+
     def search_lyrics(self, song: Song) -> Optional[str]:
         """
         Search for lyrics using all available providers.
@@ -644,10 +677,10 @@ class Downloader:
 
             # Create the output directory if it doesn't exist
             output_file.parent.mkdir(parents=True, exist_ok=True)
-            if song.download_url is None:
-                download_url = self.search(song)
-            else:
-                download_url = song.download_url
+            # if song.download_url is None:
+            #     download_url = self.search(song)
+            # else:
+            #     download_url = song.download_url
 
             # Initialize audio downloader
             audio_downloader: Union[AudioProvider, Piped]
@@ -668,16 +701,40 @@ class Downloader:
                     yt_dlp_args=self.settings["yt_dlp_args"],
                 )
 
-            logger.debug("Downloading %s using %s", song.display_name, download_url)
 
             # Add progress hook to the audio provider
             audio_downloader.audio_handler.add_progress_hook(
                 display_progress_tracker.yt_dlp_progress_hook
             )
 
-            download_info = audio_downloader.get_download_metadata(
-                download_url, download=True
-            )
+            # Try the best URL first, then fall back to other candidates if yt-dlp fails
+
+            download_info = None
+            if song.download_url is None:
+                candidate_urls = self.search_all(song)
+            else:
+                candidate_urls = [self.download_url]
+
+            last_error: Optional[Exception] = None
+            for candidate_url in candidate_urls:
+                try:
+                    logger.debug("Downloading %s using %s", song.display_name, candidate_url)
+                    download_info = audio_downloader.get_download_metadata(
+                        candidate_url, download=True
+                    )
+                    break
+                except AudioProviderError as exc:
+                    logger.info(
+                        "yt-dlp failed for %s, trying next URL. Error: %s",
+                        candidate_url,
+                        exc,
+                    )
+                    last_error = exc
+
+            if download_info is None:
+                raise DownloaderError(
+                    f"yt-dlp failed to download: {song.name} - {song.artist}"
+                ) from last_error
 
             temp_file = Path(
                 temp_folder / f"{download_info['id']}.{download_info['ext']}"
@@ -687,7 +744,7 @@ class Downloader:
                 logger.debug(
                     "No download info found for %s, url: %s",
                     song.display_name,
-                    download_url,
+                    candidate_url,
                 )
 
                 raise DownloaderError(
@@ -785,7 +842,7 @@ class Downloader:
 
             # Set the song's download url
             if song.download_url is None:
-                song.download_url = download_url
+                song.download_url = candidate_url
 
             display_progress_tracker.notify_conversion_complete()
 
